@@ -1,0 +1,124 @@
+"""Build and deliver the daily financial reporting summary through Outlook."""
+
+from __future__ import annotations
+
+import html
+import os
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+import win32com.client as win32
+
+
+def required_env(name: str) -> str:
+    """Return a required environment variable or raise a clear error."""
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def newest_report(folder: Path) -> Path:
+    """Return the most recently modified dated reporting workbook."""
+    files = list(folder.glob("financial_report_*.xlsx"))
+    if not files:
+        raise FileNotFoundError(f"No reporting workbooks found in {folder}")
+    return max(files, key=lambda path: path.stat().st_mtime)
+
+
+def build_html(data: pd.DataFrame) -> str:
+    """Calculate the summary metrics and return the formatted HTML body."""
+    required_columns = {"MARKET_VALUE", "ACCOUNT_ID", "MANAGEMENT_FLAG"}
+    missing = required_columns.difference(data.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    clean = data.copy()
+    clean["MARKET_VALUE"] = pd.to_numeric(
+        clean["MARKET_VALUE"], errors="coerce"
+    ).fillna(0)
+    clean["MANAGEMENT_FLAG"] = (
+        clean["MANAGEMENT_FLAG"].fillna("Unknown").astype(str)
+    )
+
+    total_value = clean["MARKET_VALUE"].sum()
+    total_accounts = clean["ACCOUNT_ID"].nunique()
+
+    value_by_flag = clean.groupby("MANAGEMENT_FLAG")["MARKET_VALUE"].sum().sort_index()
+    accounts_by_flag = (
+        clean.groupby("MANAGEMENT_FLAG")["ACCOUNT_ID"].nunique().sort_index()
+    )
+
+    value_rows = "".join(
+        f"<tr><td>{html.escape(flag)}</td><td>${value:,.2f}</td>"
+        f"<td>{(value / total_value * 100 if total_value else 0):.2f}%</td></tr>"
+        for flag, value in value_by_flag.items()
+    )
+    account_rows = "".join(
+        f"<tr><td>{html.escape(flag)}</td><td>{count:,}</td>"
+        f"<td>{(count / total_accounts * 100 if total_accounts else 0):.2f}%</td></tr>"
+        for flag, count in accounts_by_flag.items()
+    )
+
+    table_style = "border-collapse:collapse;font-family:Arial,sans-serif;font-size:14px;"
+    cell_style = "border:1px solid #b7b7b7;padding:7px 10px;text-align:left;"
+
+    return f"""
+    <div style="font-family:Arial,sans-serif;color:#222;">
+      <h2>Daily Financial Portfolio Summary</h2>
+      <h3>Total Market Value</h3>
+      <table style="{table_style}">
+        <tr><th style="{cell_style}">Total Market Value</th></tr>
+        <tr><td style="{cell_style}">${total_value:,.2f}</td></tr>
+      </table>
+
+      <h3>Market Value by Management Flag</h3>
+      <table style="{table_style}">
+        <tr><th style="{cell_style}">Flag</th><th style="{cell_style}">Market Value</th><th style="{cell_style}">Percentage</th></tr>
+        {value_rows}
+      </table>
+
+      <h3>Total Distinct Accounts</h3>
+      <table style="{table_style}">
+        <tr><th style="{cell_style}">Distinct Accounts</th></tr>
+        <tr><td style="{cell_style}">{total_accounts:,}</td></tr>
+      </table>
+
+      <h3>Distinct Accounts by Management Flag</h3>
+      <table style="{table_style}">
+        <tr><th style="{cell_style}">Flag</th><th style="{cell_style}">Distinct Accounts</th><th style="{cell_style}">Percentage</th></tr>
+        {account_rows}
+      </table>
+    </div>
+    """
+
+
+def main() -> None:
+    report_folder = Path(required_env("REPORTING_OUTPUT_FOLDER")).expanduser()
+    recipients = required_env("REPORTING_EMAIL_TO")
+    send_mode = os.getenv("REPORTING_EMAIL_MODE", "draft").strip().lower()
+
+    if send_mode not in {"draft", "send"}:
+        raise ValueError("REPORTING_EMAIL_MODE must be either 'draft' or 'send'.")
+
+    report_path = newest_report(report_folder)
+    report_data = pd.read_excel(report_path)
+
+    outlook = win32.Dispatch("Outlook.Application")
+    mail = outlook.CreateItem(0)
+    mail.To = recipients
+    mail.Subject = f"Daily Financial Portfolio Summary | {datetime.now():%Y%m%d}"
+    mail.HTMLBody = build_html(report_data)
+    mail.Attachments.Add(str(report_path))
+
+    if send_mode == "send":
+        mail.Send()
+        print("Email sent successfully.")
+    else:
+        mail.Display()
+        print("Email draft opened for review.")
+
+
+if __name__ == "__main__":
+    main()
